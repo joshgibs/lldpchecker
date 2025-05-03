@@ -2,112 +2,165 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/errgroup"
-	"log/slog"
 )
 
 var logger *slog.Logger
 
-// initLogger sets up a JSON slog.Logger to stdout or a specified file.
-// Returns the logger and an *os.File if a log file was opened (nil otherwise).
-func initLogger(logFile string) (*slog.Logger, *os.File) {
+// ReferenceEntry represents a row in the expected CSV.
+type ReferenceEntry struct {
+	Hostname       string
+	LocalInterface string
+	ExpSwitch      string
+	ExpPort        string
+}
+
+// LLDPJSON mirrors lldpcli JSON output.
+type LLDPJSON struct {
+	LLDP struct {
+		Interface []struct {
+			IfName  string `json:"ifname"`
+			Port    struct { ID struct { Value string `json:"value"` } `json:"id"` } `json:"port"`
+			Chassis struct { Name string `json:"name"` } `json:"chassis"`
+		} `json:"interface"`
+	} `json:"lldp"`
+}
+
+// initLogger sets up structured JSON logging to stdout or a file.
+func initLogger(path string) (*slog.Logger, *os.File) {
 	var handler slog.Handler
 	var f *os.File
-	if logFile != "" {
+	if path != "" {
 		var err error
-		f, err = os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		f, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to open log file %s: %v\n", logFile, err)
+			fmt.Fprintf(os.Stderr, "cannot open log file %s: %v\n", path, err)
 			os.Exit(1)
 		}
-		handler = slog.NewJSONHandler(f, &slog.HandlerOptions{})
+		handler = slog.NewJSONHandler(f, nil)
 	} else {
-		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{})
+		handler = slog.NewJSONHandler(os.Stdout, nil)
 	}
 	return slog.New(handler), f
 }
 
 func main() {
-	// Flags
-	hostsFile := flag.String("hosts-file", "hosts.txt", "File with one hostname or IP per line")
-	csvPath := flag.String("csv", "expected.csv", "Path to expected CSV file")
-	jsonDir := flag.String("json-dir", "./lldp_json", "Local directory to store LLDP JSON files")
-	logFile := flag.String("log-file", "", "JSON log output file (defaults to stdout)")
+	// Compute default concurrency based on available CPUs
+	defaultConc := runtime.NumCPU()
+
+	// flags
+	hostsFile := flag.String("hosts-file", "hosts.txt", "list of hosts to check")
+	csvFile := flag.String("csv", "expected.csv", "expected mapping CSV file")
+	outDir := flag.String("json-dir", "lldp_json", "directory to store LLDP JSON files")
+	logPath := flag.String("log-file", "", "JSON log output file (defaults to stdout)")
+	concurrency := flag.Int("concurrency", defaultConc, fmt.Sprintf("max parallel SSH/SCP operations (default %d)", defaultConc))
+	sshTimeout := flag.Duration("timeout", 10*time.Second, "per-host SSH/SCP timeout duration")
 	flag.Parse()
 
-	// Initialize structured logging
-	var logFD *os.File
-	logger, logFD = initLogger(*logFile)
-	if logFD != nil {
-		defer logFD.Close()
+	// setup logger
+	var logF *os.File
+	logger, logF = initLogger(*logPath)
+	if logF != nil {
+		defer logF.Close()
 	}
 
-	// Ensure output directory exists
-	if err := os.MkdirAll(*jsonDir, 0755); err != nil {
-		logger.Error("Failed to create JSON dir", "dir", *jsonDir, "err", err)
+	// ensure output directory
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		logger.Error("failed to create output directory", "dir", *outDir, "err", err)
 		os.Exit(1)
 	}
 
-	// Load expected references
-	references, err := loadReferences(*csvPath)
+	// load CSV references
+	refs, err := loadReferences(*csvFile)
 	if err != nil {
-		logger.Error("Failed to load CSV", "csv", *csvPath, "err", err)
+		logger.Error("failed to load CSV", "file", *csvFile, "err", err)
 		os.Exit(1)
 	}
 
-	// Read hosts list
+	// read host list
 	hosts, err := readHosts(*hostsFile)
 	if err != nil {
-		logger.Error("Failed to read hosts file", "file", *hostsFile, "err", err)
+		logger.Error("failed to read hosts file", "file", *hostsFile, "err", err)
 		os.Exit(1)
 	}
 
-	// Parallel LLDP checks
-	var g errgroup.Group
-	for _, host := range hosts {
-		host := host
+	ctx := context.Background()
+	g, ctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, *concurrency)
+
+	for _, h := range hosts {
+		h := h
 		g.Go(func() error {
-			remotePath := fmt.Sprintf("/tmp/%s-lldp.json", host)
-			// SSH to generate LLDP JSON
-			if out, err := exec.Command("ssh", host,
-				"lldpcli show neighbor -f JSON > "+remotePath).CombinedOutput(); err != nil {
-				logger.Error("SSH command failed", "host", host, "err", err, "output", string(out))
-				return err
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
 			}
-
-			// SCP JSON back to local
-			localPath := filepath.Join(*jsonDir, host+"-lldp.json")
-			if out, err := exec.Command("scp", host+":"+remotePath, localPath).CombinedOutput(); err != nil {
-				logger.Error("SCP failed", "host", host, "err", err, "output", string(out))
-				return err
-			}
-
-			// Compare LLDP data
-			if err := checkHost(localPath, host, references); err != nil {
-				logger.Error("Host check failed", "host", host, "err", err)
-				return err
-			}
-			return nil
+			defer func() { <-sem }()
+			return processHost(ctx, h, *outDir, refs, *sshTimeout)
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		logger.Error("Error during LLDP checks", "err", err)
+		logger.Error("verification failed", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("Completed LLDP verification for all hosts")
+	logger.Info("all hosts verified successfully")
 }
 
-// readHosts loads a newline-delimited host file.
+// processHost runs SSH and SCP with per-host timeout, then verifies LLDP.
+func processHost(parentCtx context.Context, host, outDir string, refs map[string]map[string]ReferenceEntry, timeout time.Duration) error {
+	sshCtx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
+	remote := fmt.Sprintf("/tmp/%s-lldp.json", host)
+	if err := runSSH(sshCtx, host, fmt.Sprintf("lldpcli show neighbor -f JSON > %s", remote)); err != nil {
+		return err
+	}
+
+	scpCtx, cancelScp := context.WithTimeout(parentCtx, timeout)
+	defer cancelScp()
+	local := filepath.Join(outDir, host+"-lldp.json")
+	if err := runSCP(scpCtx, host, remote, local); err != nil {
+		return err
+	}
+
+	return checkHost(local, host, refs)
+}
+
+// runSSH executes a command over SSH using provided context.
+func runSSH(ctx context.Context, host, cmd string) error {
+	ex := exec.CommandContext(ctx, "ssh", host, cmd)
+	if out, err := ex.CombinedOutput(); err != nil {
+		logger.Error("ssh failed", "host", host, "err", err, "out", string(out))
+		return err
+	}
+	return nil
+}
+
+// runSCP copies a remote file locally using provided context.
+func runSCP(ctx context.Context, host, remote, local string) error {
+	ex := exec.CommandContext(ctx, "scp", host+":"+remote, local)
+	if out, err := ex.CombinedOutput(); err != nil {
+		logger.Error("scp failed", "host", host, "err", err, "out", string(out))
+		return err
+	}
+	return nil
+}
+
+// readHosts loads hostnames, skipping blank lines and comments.
 func readHosts(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -115,19 +168,19 @@ func readHosts(path string) ([]string, error) {
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	hosts := []string{}
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+	s := bufio.NewScanner(f)
+	h := make([]string, 0, 64)
+	for s.Scan() {
+		l := strings.TrimSpace(s.Text())
+		if l == "" || strings.HasPrefix(l, "#") {
 			continue
 		}
-		hosts = append(hosts, line)
+		h = append(h, l)
 	}
-	return hosts, scanner.Err()
+	return h, s.Err()
 }
 
-// loadReferences reads expected.csv into a nested map.
+// loadReferences reads expected CSV into nested map.
 func loadReferences(path string) (map[string]map[string]ReferenceEntry, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -136,77 +189,65 @@ func loadReferences(path string) (map[string]map[string]ReferenceEntry, error) {
 	defer f.Close()
 
 	r := csv.NewReader(f)
-	recs, err := r.ReadAll()
-	if err != nil {
+	refs := make(map[string]map[string]ReferenceEntry)
+	if _, err := r.Read(); err != nil {
 		return nil, err
 	}
-
-	refs := make(map[string]map[string]ReferenceEntry)
-	for i, rec := range recs {
-		if i == 0 {
-			continue
+	for {
+		rec, err := r.Read()
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			return nil, err
 		}
 		if len(rec) < 4 {
-			logger.Warn("Skipping malformed CSV line", "line", i+1, "record", rec)
+			logger.Warn("malformed CSV record", "record", rec)
 			continue
 		}
-		h := strings.TrimSpace(rec[0])
-		iface := strings.TrimSpace(rec[1])
-		sw := strings.TrimSpace(rec[2])
-		port := strings.TrimSpace(rec[3])
-
+		h, i, sw, p := strings.TrimSpace(rec[0]), strings.TrimSpace(rec[1]), strings.TrimSpace(rec[2]), strings.TrimSpace(rec[3])
 		if refs[h] == nil {
 			refs[h] = make(map[string]ReferenceEntry)
 		}
-		refs[h][iface] = ReferenceEntry{h, iface, sw, port}
+		refs[h][i] = ReferenceEntry{h, i, sw, p}
 	}
 	return refs, nil
 }
 
-// checkHost parses local JSON, compares to refs, returns error on issues.
-func checkHost(jsonFile, hostname string, refs map[string]map[string]ReferenceEntry) error {
-	data, err := os.ReadFile(jsonFile)
+// checkHost parses JSON file and compares to expected entries.
+func checkHost(file, host string, refs map[string]map[string]ReferenceEntry) error {
+	f, err := os.Open(file)
 	if err != nil {
-		return fmt.Errorf("%s: error reading JSON: %w", hostname, err)
+		return fmt.Errorf("%s read error: %w", host, err)
+	}
+	defer f.Close()
+
+	var data LLDPJSON
+	if err := json.NewDecoder(f).Decode(&data); err != nil {
+		return fmt.Errorf("%s decode error: %w", host, err)
 	}
 
-	var lj LLDPJSON
-	if err := json.Unmarshal(data, &lj); err != nil {
-		return fmt.Errorf("%s: JSON unmarshal error: %w", hostname, err)
-	}
-
-	expectedMap, ok := refs[hostname]
+	exp, ok := refs[host]
 	if !ok {
-		logger.Warn("No reference entries for host", "host", hostname)
+		logger.Warn("no expected data for host", "host", host)
 		return nil
 	}
-
-	for _, intf := range lj.LLDP.Interface {
-		re, found := expectedMap[intf.IfName]
-		if !found {
-			logger.Warn("Unexpected interface", "host", hostname, "iface", intf.IfName)
+	for _, iface := range data.LLDP.Interface {
+		rec, ok := exp[iface.IfName]
+		if !ok {
+			logger.Warn("unexpected interface", "host", host, "iface", iface.IfName)
 			continue
 		}
-
-		actSw := intf.Chassis.Name
-		actPort := intf.Port.ID.Value
-
-		if actSw != re.ExpSwitch || actPort != re.ExpPort {
-			logger.Warn("Mismatch",
-				"host", hostname,
-				"iface", intf.IfName,
-				"got_switch", actSw,
-				"got_port", actPort,
-				"expected_switch", re.ExpSwitch,
-				"expected_port", re.ExpPort,
+		gotSw, gotPr := iface.Chassis.Name, iface.Port.ID.Value
+		if gotSw != rec.ExpSwitch || gotPr != rec.ExpPort {
+			logger.Warn("mismatch",
+				"host", host,
+				"iface", iface.IfName,
+				"got", fmt.Sprintf("%s/%s", gotSw, gotPr),
+				"expected", fmt.Sprintf("%s/%s", rec.ExpSwitch, rec.ExpPort),
 			)
 		} else {
-			logger.Info("OK",
-				"host", hostname,
-				"iface", intf.IfName,
-				"switch", actSw,
-				"port", actPort,
-			)
+			logger.Info("match", "host", host, "iface", iface.IfName)
 		}
 	}
 	return nil
