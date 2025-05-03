@@ -1,0 +1,12 @@
+# Sample lldp-check configuration
+config-file: "./config.yaml"       # optional, self-reference ignored
+hosts-file: "servers.txt"          # one host per line
+csv-file: "expected.csv"           # mapping CSV
+json-dir: "lldp_outputs"           # local JSON output directory
+ssh-user: "admin"                  # SSH username
+key-file: "/home/admin/.ssh/id_rsa" # SSH private key path
+ssh-password: ""                   # optional SSH password
+remote-dir: "/tmp"                 # remote temp directory
+concurrency: 8                     # max parallel SSH operations
+timeout: "20s"                     # per-host timeout duration
+retries: 3                         # SSH retry attempt
